@@ -1,5 +1,6 @@
 from flask import Flask, render_template, request, jsonify, Response
 import pandas as pd
+import io  # ✅ Add this import
 import requests
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor

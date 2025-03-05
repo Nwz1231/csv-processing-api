@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, Response, send_file
+from flask import Flask, render_template, request, jsonify, Response
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -61,14 +61,21 @@ def get_last_scan_details(awb):
         return None, None
 
 # ✅ Process CSV Data
-def process_csv_data(file_stream):
-    logging.info("Reading CSV file.")
-    df = pd.read_csv(file_stream, dtype=str)  # Read all as strings to prevent errors
-    logging.info(f"Initial file shape: {df.shape}")
+def process_csv_data(file_stream, file_extension):
+    logging.info("Reading CSV/XLSX file.")
+    
+    # ✅ Read CSV or XLSX
+    if file_extension == 'csv':
+        df = pd.read_csv(file_stream, dtype=str)  
+    else:  # XLSX
+        df = pd.read_excel(file_stream, dtype=str)
 
+    logging.info(f"✅ Initial file loaded. Shape: {df.shape}")
+
+    # ✅ Drop unnecessary data
     if 'TICKET STATUS' in df.columns:
         df = df[~df['TICKET STATUS'].str.contains("Closed", na=False)]
-        logging.info(f"Filtered closed tickets. New shape: {df.shape}")
+        logging.info(f"✅ Removed 'Closed' tickets. New shape: {df.shape}")
 
     for col in ['PRIORITY', 'DEPARTMENT']:
         if col in df.columns:
@@ -77,16 +84,26 @@ def process_csv_data(file_stream):
     if 'CATEGORY NAME' in df.columns:
         df = df[~df['CATEGORY NAME'].isin(["OTHERS", "DISPUTE"])]
 
-    # Fetch tracking details
+    # ✅ Fetch tracking details **only for Bluedart and Delhivery**
     if 'TRACKING ID' in df.columns and 'COURIER NAME' in df.columns:
-        awb_numbers = df['TRACKING ID'].dropna().unique()
+        bluedart_awbs = df[df['COURIER NAME'].isin(['Bluedart', 'BlueDart Surface'])]['TRACKING ID'].dropna().unique()
+        delhivery_awbs = df[df['COURIER NAME'].isin(['Delhivery Express', 'Delhivery FR', 'Delhivery FR Surface 10kg'])]['TRACKING ID'].dropna().unique()
+
+        logging.info(f"Fetching Bluedart details for {len(bluedart_awbs)} AWBs")
+        logging.info(f"Fetching Delhivery details for {len(delhivery_awbs)} AWBs")
 
         with ThreadPoolExecutor(max_workers=10) as executor:
-            bluedart_results = dict(zip(awb_numbers, executor.map(fetch_data_for_awb, awb_numbers)))
-            delhivery_results = dict(zip(awb_numbers, executor.map(get_last_scan_details, awb_numbers)))
+            bluedart_results = dict(zip(bluedart_awbs, executor.map(fetch_data_for_awb, bluedart_awbs)))
+            delhivery_results = dict(zip(delhivery_awbs, executor.map(get_last_scan_details, delhivery_awbs)))
 
-        df['Details'] = df['TRACKING ID'].map(lambda x: bluedart_results.get(x, (None, None))[0])
-        df['Details Date'] = df['TRACKING ID'].map(lambda x: bluedart_results.get(x, (None, None))[1])
+        df['Details'] = df.apply(lambda row: bluedart_results.get(row['TRACKING ID'], (None, None))[0]
+                                 if row['COURIER NAME'] in ['Bluedart', 'BlueDart Surface'] else None, axis=1)
+        df['Details Date'] = df.apply(lambda row: bluedart_results.get(row['TRACKING ID'], (None, None))[1]
+                                      if row['COURIER NAME'] in ['Bluedart', 'BlueDart Surface'] else None, axis=1)
+        df['Delhivery Status'] = df.apply(lambda row: delhivery_results.get(row['TRACKING ID'], (None, None))[0]
+                                          if row['COURIER NAME'] in ['Delhivery Express', 'Delhivery FR', 'Delhivery FR Surface 10kg'] else None, axis=1)
+        df['Delhivery Date'] = df.apply(lambda row: delhivery_results.get(row['TRACKING ID'], (None, None))[1]
+                                        if row['COURIER NAME'] in ['Delhivery Express', 'Delhivery FR', 'Delhivery FR Surface 10kg'] else None, axis=1)
 
     logging.info(f"Final processed file shape: {df.shape}")
     return df
@@ -110,18 +127,34 @@ def process_csv():
 
     try:
         logging.info(f"Processing file: {file.filename}")
-        processed_df = process_csv_data(file)
-        csv_output = io.StringIO()
-        processed_df.to_csv(csv_output, index=False)
-        csv_output.seek(0)
 
-        return Response(
-            csv_output.getvalue(),
-            mimetype="text/csv",
-            headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"}
-        )
+        # ✅ Get file extension
+        file_extension = file.filename.rsplit('.', 1)[-1].lower()
+        if file_extension not in ['csv', 'xlsx']:
+            return jsonify({"error": "Only CSV and XLSX files are supported."}), 400
+
+        # ✅ Process the file
+        processed_df = process_csv_data(file, file_extension)
+
+        # ✅ Convert output to CSV or XLSX
+        if file_extension == 'csv':
+            output = io.StringIO()
+            processed_df.to_csv(output, index=False)
+            output.seek(0)
+            return Response(output.getvalue(),
+                            mimetype="text/csv",
+                            headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"})
+        else:  # XLSX
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                processed_df.to_excel(writer, index=False)
+            output.seek(0)
+            return Response(output.getvalue(),
+                            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"})
+
     except Exception as e:
-        logging.error(f"Error processing CSV file: {e}")
+        logging.error(f"❌ Error processing file: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':

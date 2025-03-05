@@ -1,25 +1,31 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, render_template, request, jsonify, Response
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
-from io import StringIO
 import os
+import logging
 
 app = Flask(__name__)
 
+# Setup logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
+
+# ----------------- File Processing Functions -----------------
+
 def fetch_data_for_awb(awb):
-    # Note: Check that the URL formatting is correct (e.g. awb parameter substitution)
     url = f"https://api.bluedart.com/servlet/RoutingServlet?handler=tnt&action=custawbquery&loginid=BOM03691&awb=awb&numbers={awb}&format=html&lickey=81a9b858e8646c710d04b36f8e9dc177&verno=1.3f&scan=1"
     try:
+        logging.info(f"Fetching data for AWB: {awb}")
         response = requests.get(url)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
 
-        # Loop through font tags to check for "Waybill No" text and then extract details.
         for font in soup.find_all('font'):
             if "Waybill No" in font.text:
-                # Example extraction (adjust as needed)
                 waybill_number = font.find_next('b').text.strip()
                 break
 
@@ -30,15 +36,18 @@ def fetch_data_for_awb(awb):
                 details = columns[1].text.strip()
                 date = columns[2].text.strip()
                 time = columns[3].text.strip()
+                logging.info(f"Fetched details for AWB {awb}: {details}, {date} {time}")
                 return details, f"{date} {time}"
-
+        logging.info(f"No details found for AWB {awb}")
         return None, None
-    except requests.RequestException:
+    except requests.RequestException as e:
+        logging.error(f"Request error for AWB {awb}: {e}")
         return None, None
 
 def get_last_scan_details(awb):
     url = f'https://selloship.com/vendor/test/track_order/{awb}'
     try:
+        logging.info(f"Fetching last scan details for AWB: {awb}")
         response = requests.get(url)
         response.raise_for_status()
         content = response.text
@@ -47,34 +56,38 @@ def get_last_scan_details(awb):
             last_scan_section = content[last_scan_index:]
             instructions = last_scan_section.split("[Instructions] => ")[1].split("\n")[0].strip()
             status_datetime = last_scan_section.split("[StatusDateTime] => ")[1].split("\n")[0].strip()
+            logging.info(f"Fetched last scan for AWB {awb}: {instructions}, {status_datetime}")
             return instructions, status_datetime
         else:
+            logging.info(f"No scan details found for AWB {awb}")
             return None, None
     except requests.RequestException as e:
-        print(f"Request failed for AWB {awb}: {e}")
+        logging.error(f"Request failed for AWB {awb}: {e}")
         return None, None
 
 def process_csv_data(file_stream):
+    logging.info("Reading CSV file.")
     df = pd.read_csv(file_stream)
+    logging.info(f"CSV file loaded with shape {df.shape}.")
 
-    # Step 3: Remove rows where 'TICKET STATUS' contains 'Closed'.
     if 'TICKET STATUS' in df.columns:
         df = df[~df['TICKET STATUS'].str.contains("Closed", na=False)]
+        logging.info("Removed rows with 'Closed' ticket status.")
 
-    # Step 4: Remove columns 'PRIORITY' and 'DEPARTMENT'.
     for col in ['PRIORITY', 'DEPARTMENT']:
         if col in df.columns:
             df.drop(columns=[col], inplace=True)
+            logging.info(f"Dropped column: {col}")
 
-    # Step 5: Remove rows where 'CATEGORY NAME' is 'OTHERS' or 'DISPUTE'.
     if 'CATEGORY NAME' in df.columns:
         df = df[~df['CATEGORY NAME'].isin(["OTHERS", "DISPUTE"])]
+        logging.info("Removed rows where CATEGORY NAME is 'OTHERS' or 'DISPUTE'.")
 
-    # Step 6: Fetching details for Bluedart Data.
     if 'TRACKING ID' in df.columns and 'COURIER NAME' in df.columns:
         filtered_df = df[df['COURIER NAME'].isin(['Bluedart', 'BlueDart Surface'])].copy()
         awb_numbers = filtered_df['TRACKING ID'].dropna().unique()
         if len(awb_numbers) > 0:
+            logging.info(f"Fetching Bluedart details for {len(awb_numbers)} AWB numbers.")
             details_results = []
             details_dates = []
             with ThreadPoolExecutor(max_workers=10) as executor:
@@ -86,12 +99,14 @@ def process_csv_data(file_stream):
             details_date_map = {awb: date_time for awb, date_time in zip(awb_numbers, details_dates) if date_time}
             df['Details'] = df.get('Details', pd.Series(index=df.index)).combine_first(df['TRACKING ID'].map(details_map))
             df['Details Date'] = df.get('Details Date', pd.Series(index=df.index)).combine_first(df['TRACKING ID'].map(details_date_map))
+            logging.info("Bluedart details updated in dataframe.")
 
-    # Step 7: Fetching details for Delhivery Data.
     if 'TRACKING ID' in df.columns and 'COURIER NAME' in df.columns:
-        delhivery_filtered_df = df[df['COURIER NAME'].isin(['Delhivery Express', 'Delhivery FR', 'Delhivery FR Surface 10kg'])].copy()
+        delhivery_filtered_df = df[df['COURIER NAME'].isin(
+            ['Delhivery Express', 'Delhivery FR', 'Delhivery FR Surface 10kg'])].copy()
         delhivery_awb_numbers = delhivery_filtered_df['TRACKING ID'].dropna().unique()
         if len(delhivery_awb_numbers) > 0:
+            logging.info(f"Fetching Delhivery details for {len(delhivery_awb_numbers)} AWB numbers.")
             delhivery_details_results = []
             delhivery_dates = []
             with ThreadPoolExecutor(max_workers=10) as executor:
@@ -103,29 +118,54 @@ def process_csv_data(file_stream):
             delhivery_date_map = {awb: status_datetime for awb, status_datetime in zip(delhivery_awb_numbers, delhivery_dates) if status_datetime}
             df['Details'] = df.get('Details', pd.Series(index=df.index)).combine_first(df['TRACKING ID'].map(delhivery_details_map))
             df['Details Date'] = df.get('Details Date', pd.Series(index=df.index)).combine_first(df['TRACKING ID'].map(delhivery_date_map))
+            logging.info("Delhivery details updated in dataframe.")
 
+    logging.info("CSV processing complete.")
     return df
 
+# ----------------- Routes -----------------
+
 @app.route('/')
-def index():
-    return "CSV Processing API is running."
+def home():
+    return render_template('index.html')
 
 @app.route('/process-csv', methods=['POST'])
 def process_csv():
+    logging.info("Received request at '/process-csv' endpoint.")
     if 'file' not in request.files:
+        logging.error("No file provided in the request.")
         return jsonify({"error": "No file provided."}), 400
     file = request.files['file']
     if file.filename == '':
+        logging.error("No file selected.")
         return jsonify({"error": "No file selected."}), 400
+    file_extension = file.filename.rsplit('.', 1)[-1].lower()
+    if file_extension not in ['csv', 'xlsx']:
+        logging.error("Invalid file format.")
+        return jsonify({"error": "Only CSV and XLSX files are supported."}), 400
+
     try:
-        processed_df = process_csv_data(file)
-        csv_output = processed_df.to_csv(index=False)
-        return Response(csv_output,
-                        mimetype="text/csv",
-                        headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"})
+        logging.info(f"Processing file: {file.filename}")
+        if file_extension == 'csv':
+            processed_df = process_csv_data(file)
+            csv_output = processed_df.to_csv(index=False)
+            return Response(csv_output,
+                            mimetype="text/csv",
+                            headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"})
+        elif file_extension == 'xlsx':
+            df = pd.read_excel(file)
+            processed_df = process_csv_data(file)
+            output = StringIO()
+            processed_df.to_excel(output, index=False, engine='openpyxl')
+            output.seek(0)
+            return Response(output.getvalue(),
+                            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"})
     except Exception as e:
+        logging.error(f"Error processing file: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
+    logging.info(f"Starting app on port {port}")
     app.run(host='0.0.0.0', port=port)

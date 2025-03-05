@@ -1,26 +1,21 @@
-from flask import Flask, render_template, request, jsonify, Response
+from flask import Flask, request, jsonify, Response
 import pandas as pd
-import io  # ✅ Add this import
 import requests
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
+from io import StringIO
 import os
 import logging
 
 app = Flask(__name__)
 
-# Setup logging configuration
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s'
-)
-
-# ----------------- File Processing Functions -----------------
+# ✅ Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 def fetch_data_for_awb(awb):
     url = f"https://api.bluedart.com/servlet/RoutingServlet?handler=tnt&action=custawbquery&loginid=BOM03691&awb=awb&numbers={awb}&format=html&lickey=81a9b858e8646c710d04b36f8e9dc177&verno=1.3f&scan=1"
     try:
-        logging.info(f"Fetching data for AWB: {awb}")
+        logging.info(f"Fetching Blueddart data for AWB: {awb}")
         response = requests.get(url)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
@@ -39,16 +34,16 @@ def fetch_data_for_awb(awb):
                 time = columns[3].text.strip()
                 logging.info(f"Fetched details for AWB {awb}: {details}, {date} {time}")
                 return details, f"{date} {time}"
-        logging.info(f"No details found for AWB {awb}")
+        logging.warning(f"No details found for AWB {awb}")
         return None, None
     except requests.RequestException as e:
-        logging.error(f"Request error for AWB {awb}: {e}")
+        logging.error(f"Request error for Blueddart AWB {awb}: {e}")
         return None, None
 
 def get_last_scan_details(awb):
     url = f'https://selloship.com/vendor/test/track_order/{awb}'
     try:
-        logging.info(f"Fetching last scan details for AWB: {awb}")
+        logging.info(f"Fetching Delhivery scan details for AWB: {awb}")
         response = requests.get(url)
         response.raise_for_status()
         content = response.text
@@ -59,125 +54,86 @@ def get_last_scan_details(awb):
             status_datetime = last_scan_section.split("[StatusDateTime] => ")[1].split("\n")[0].strip()
             logging.info(f"Fetched last scan for AWB {awb}: {instructions}, {status_datetime}")
             return instructions, status_datetime
-        else:
-            logging.info(f"No scan details found for AWB {awb}")
-            return None, None
+        logging.warning(f"No scan details found for Delhivery AWB {awb}")
+        return None, None
     except requests.RequestException as e:
-        logging.error(f"Request failed for AWB {awb}: {e}")
+        logging.error(f"Request failed for Delhivery AWB {awb}: {e}")
         return None, None
 
 def process_csv_data(file_stream):
     logging.info("Reading CSV file.")
-    df = pd.read_csv(file_stream)
-    logging.info(f"CSV file loaded with shape {df.shape}.")
+    df = pd.read_csv(file_stream, dtype=str)  # ✅ Read everything as string to prevent scientific notation
+    logging.info(f"Initial file shape: {df.shape}")
 
+    # Step 3: Remove rows where 'TICKET STATUS' contains 'Closed'.
     if 'TICKET STATUS' in df.columns:
         df = df[~df['TICKET STATUS'].str.contains("Closed", na=False)]
-        logging.info("Removed rows with 'Closed' ticket status.")
+        logging.info(f"After removing 'Closed' tickets, new shape: {df.shape}")
 
+    # Step 4: Remove unnecessary columns
     for col in ['PRIORITY', 'DEPARTMENT']:
         if col in df.columns:
             df.drop(columns=[col], inplace=True)
-            logging.info(f"Dropped column: {col}")
+            logging.info(f"Removed column: {col}")
 
+    # Step 5: Remove rows where 'CATEGORY NAME' is 'OTHERS' or 'DISPUTE'.
     if 'CATEGORY NAME' in df.columns:
         df = df[~df['CATEGORY NAME'].isin(["OTHERS", "DISPUTE"])]
-        logging.info("Removed rows where CATEGORY NAME is 'OTHERS' or 'DISPUTE'.")
+        logging.info(f"After filtering CATEGORY NAME, new shape: {df.shape}")
 
+    # Step 6: Fetch Bluedart Data
     if 'TRACKING ID' in df.columns and 'COURIER NAME' in df.columns:
-        filtered_df = df[df['COURIER NAME'].isin(['Bluedart', 'BlueDart Surface'])].copy()
-        awb_numbers = filtered_df['TRACKING ID'].dropna().unique()
+        bluedart_df = df[df['COURIER NAME'].isin(['Bluedart', 'BlueDart Surface'])]
+        awb_numbers = bluedart_df['TRACKING ID'].dropna().unique()
+        logging.info(f"Fetching Bluedart details for {len(awb_numbers)} AWB numbers.")
+
         if len(awb_numbers) > 0:
-            logging.info(f"Fetching Bluedart details for {len(awb_numbers)} AWB numbers.")
-            details_results = []
-            details_dates = []
             with ThreadPoolExecutor(max_workers=10) as executor:
                 results = list(executor.map(fetch_data_for_awb, awb_numbers))
-            for details, date_time in results:
-                details_results.append(details)
-                details_dates.append(date_time)
-            details_map = {awb: details for awb, details in zip(awb_numbers, details_results) if details}
-            details_date_map = {awb: date_time for awb, date_time in zip(awb_numbers, details_dates) if date_time}
-            df['Details'] = df.get('Details', pd.Series(index=df.index)).combine_first(df['TRACKING ID'].map(details_map))
-            df['Details Date'] = df.get('Details Date', pd.Series(index=df.index)).combine_first(df['TRACKING ID'].map(details_date_map))
-            logging.info("Bluedart details updated in dataframe.")
+            details_map = {awb: details for awb, details in zip(awb_numbers, results) if details}
+            df['Details'] = df['TRACKING ID'].map(details_map)
 
+    # Step 7: Fetch Delhivery Data
     if 'TRACKING ID' in df.columns and 'COURIER NAME' in df.columns:
-        delhivery_filtered_df = df[df['COURIER NAME'].isin(
-            ['Delhivery Express', 'Delhivery FR', 'Delhivery FR Surface 10kg'])].copy()
-        delhivery_awb_numbers = delhivery_filtered_df['TRACKING ID'].dropna().unique()
+        delhivery_df = df[df['COURIER NAME'].isin(['Delhivery Express', 'Delhivery FR', 'Delhivery FR Surface 10kg'])]
+        delhivery_awb_numbers = delhivery_df['TRACKING ID'].dropna().unique()
+        logging.info(f"Fetching Delhivery details for {len(delhivery_awb_numbers)} AWB numbers.")
+
         if len(delhivery_awb_numbers) > 0:
-            logging.info(f"Fetching Delhivery details for {len(delhivery_awb_numbers)} AWB numbers.")
-            delhivery_details_results = []
-            delhivery_dates = []
             with ThreadPoolExecutor(max_workers=10) as executor:
                 results = list(executor.map(get_last_scan_details, delhivery_awb_numbers))
-            for instructions, status_datetime in results:
-                delhivery_details_results.append(instructions)
-                delhivery_dates.append(status_datetime)
-            delhivery_details_map = {awb: details for awb, details in zip(delhivery_awb_numbers, delhivery_details_results) if details}
-            delhivery_date_map = {awb: status_datetime for awb, status_datetime in zip(delhivery_awb_numbers, delhivery_dates) if status_datetime}
-            df['Details'] = df.get('Details', pd.Series(index=df.index)).combine_first(df['TRACKING ID'].map(delhivery_details_map))
-            df['Details Date'] = df.get('Details Date', pd.Series(index=df.index)).combine_first(df['TRACKING ID'].map(delhivery_date_map))
-            logging.info("Delhivery details updated in dataframe.")
+            scan_map = {awb: scan for awb, scan in zip(delhivery_awb_numbers, results) if scan}
+            df['Details'] = df['TRACKING ID'].map(scan_map)
 
-    logging.info("CSV processing complete.")
+    logging.info(f"Final processed file shape: {df.shape}")
     return df
 
-# ----------------- Routes -----------------
-
 @app.route('/')
-def home():
-    return render_template('index.html')
+def index():
+    return "CSV Processing API is running."
 
 @app.route('/process-csv', methods=['POST'])
 def process_csv():
     logging.info("Received request at '/process-csv' endpoint.")
-
     if 'file' not in request.files:
-        logging.error("No file provided in the request.")
+        logging.error("No file provided.")
         return jsonify({"error": "No file provided."}), 400
-
+    
     file = request.files['file']
     if file.filename == '':
         logging.error("No file selected.")
         return jsonify({"error": "No file selected."}), 400
-
-    file_extension = file.filename.rsplit('.', 1)[-1].lower()
-    if file_extension not in ['csv', 'xlsx']:
-        logging.error("Invalid file format.")
-        return jsonify({"error": "Only CSV and XLSX files are supported."}), 400
-
+    
     try:
         logging.info(f"Processing file: {file.filename}")
+        processed_df = process_csv_data(file)
+        csv_output = processed_df.to_csv(index=False)
 
-        if file_extension == 'csv':
-            df = pd.read_csv(file)
-            output = io.StringIO()
-            df.to_csv(output, index=False)
-            output.seek(0)
-
-            return Response(
-                output.getvalue(),
-                mimetype="text/csv",
-                headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"}
-            )
-
-        elif file_extension == 'xlsx':
-            df = pd.read_excel(file)
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False)
-            output.seek(0)
-
-            return Response(
-                output.getvalue(),
-                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"}
-            )
-
+        return Response(csv_output,
+                        mimetype="text/csv",
+                        headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"})
     except Exception as e:
-        logging.error(f"Error processing file: {e}")
+        logging.error(f"Error processing CSV file: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':

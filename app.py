@@ -33,7 +33,6 @@ def fetch_data_for_awb(awb):
                 details = columns[1].text.strip()
                 date = columns[2].text.strip()
                 time = columns[3].text.strip()
-                logging.info(f"AWB {awb}: {details}, {date} {time}")
                 return details, f"{date} {time}"
         return None, None
     except requests.RequestException as e:
@@ -96,14 +95,25 @@ def process_csv_data(file_stream, file_extension):
             bluedart_results = dict(zip(bluedart_awbs, executor.map(fetch_data_for_awb, bluedart_awbs)))
             delhivery_results = dict(zip(delhivery_awbs, executor.map(get_last_scan_details, delhivery_awbs)))
 
-        df['Details'] = df.apply(lambda row: bluedart_results.get(row['TRACKING ID'], (None, None))[0]
-                                 if row['COURIER NAME'] in ['Bluedart', 'BlueDart Surface'] else None, axis=1)
-        df['Details Date'] = df.apply(lambda row: bluedart_results.get(row['TRACKING ID'], (None, None))[1]
-                                      if row['COURIER NAME'] in ['Bluedart', 'BlueDart Surface'] else None, axis=1)
-        df['Delhivery Status'] = df.apply(lambda row: delhivery_results.get(row['TRACKING ID'], (None, None))[0]
-                                          if row['COURIER NAME'] in ['Delhivery Express', 'Delhivery FR', 'Delhivery FR Surface 10kg'] else None, axis=1)
-        df['Delhivery Date'] = df.apply(lambda row: delhivery_results.get(row['TRACKING ID'], (None, None))[1]
-                                        if row['COURIER NAME'] in ['Delhivery Express', 'Delhivery FR', 'Delhivery FR Surface 10kg'] else None, axis=1)
+        # ✅ Merge tracking data into a single column (Details & Details Date)
+        def merge_tracking_data(row):
+            awb = row['TRACKING ID']
+            courier = row['COURIER NAME']
+            
+            bluedart_details, bluedart_date = bluedart_results.get(awb, (None, None))
+            delhivery_details, delhivery_date = delhivery_results.get(awb, (None, None))
+            
+            # ✅ If Bluedart, use Bluedart data
+            if courier in ['Bluedart', 'BlueDart Surface']:
+                return bluedart_details or delhivery_details, bluedart_date or delhivery_date
+            
+            # ✅ If Delhivery, use Delhivery data
+            if courier in ['Delhivery Express', 'Delhivery FR', 'Delhivery FR Surface 10kg']:
+                return delhivery_details or bluedart_details, delhivery_date or bluedart_date
+            
+            return None, None  # For other couriers
+
+        df[['Details', 'Details Date']] = df.apply(lambda row: pd.Series(merge_tracking_data(row)), axis=1)
 
     logging.info(f"Final processed file shape: {df.shape}")
     return df

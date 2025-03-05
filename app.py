@@ -132,13 +132,16 @@ def home():
 @app.route('/process-csv', methods=['POST'])
 def process_csv():
     logging.info("Received request at '/process-csv' endpoint.")
+
     if 'file' not in request.files:
         logging.error("No file provided in the request.")
         return jsonify({"error": "No file provided."}), 400
+
     file = request.files['file']
     if file.filename == '':
         logging.error("No file selected.")
         return jsonify({"error": "No file selected."}), 400
+
     file_extension = file.filename.rsplit('.', 1)[-1].lower()
     if file_extension not in ['csv', 'xlsx']:
         logging.error("Invalid file format.")
@@ -146,21 +149,32 @@ def process_csv():
 
     try:
         logging.info(f"Processing file: {file.filename}")
+
         if file_extension == 'csv':
-            processed_df = process_csv_data(file)
-            csv_output = processed_df.to_csv(index=False)
-            return Response(csv_output,
-                            mimetype="text/csv",
-                            headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"})
+            df = pd.read_csv(file)
+            output = io.StringIO()
+            df.to_csv(output, index=False)
+            output.seek(0)
+
+            return Response(
+                output.getvalue(),
+                mimetype="text/csv",
+                headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"}
+            )
+
         elif file_extension == 'xlsx':
             df = pd.read_excel(file)
-            processed_df = process_csv_data(file)
-            output = StringIO()
-            processed_df.to_excel(output, index=False, engine='openpyxl')
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False)
             output.seek(0)
-            return Response(output.getvalue(),
-                            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"})
+
+            return Response(
+                output.getvalue(),
+                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"}
+            )
+
     except Exception as e:
         logging.error(f"Error processing file: {e}")
         return jsonify({"error": str(e)}), 500
